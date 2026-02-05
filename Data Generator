@@ -1,0 +1,366 @@
+"""
+Vaccine Trajectory Simulation Engine
+=========================
+
+Generates synthetic tumor-immune trajectories for training deep learning models
+to infer kinetic parameters from sparse clinical observations.
+
+Based on a stochastic predator-prey model:
+    - Tumor cells (T) grow and are killed by immune cells
+    - T-cells activate in response to vaccine and exhaust over time
+
+
+import numpy as np
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict
+from enum import Enum
+from pathlib import Path
+import time
+
+"""
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+N_SAMPLES = 10000          # Number of trajectories to generate (default 10k (pilot), 100k for full run)
+OUTPUT_FILE = "output_file"   
+SEED = 42                  # Random seed - set at 42 for reproducibility
+
+# Fixed observation schedule: every 7 days for 196 days (29 observations)
+OBSERVATION_TIMES = np.array([0, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98,
+                              105, 112, 119, 126, 133, 140, 147, 154, 161, 168, 175, 182, 189, 196])
+
+
+# =============================================================================
+# Data Structures
+# =============================================================================
+
+class ResponseCategory(Enum):
+    """Clinical response classification based on tumor dynamics."""
+    COMPLETE_RESPONSE = "complete_response"
+    PARTIAL_RESPONSE = "partial_response"
+    STABLE_DISEASE = "stable_disease"
+    PROGRESSIVE_DISEASE = "progressive_disease"
+
+
+@dataclass
+class SimulationParameters:
+    """
+    Kinetic parameters for the tumor-immune model.
+    All rates are in units of days^-1.
+    """
+    g: float          # Tumor growth rate
+    k_on: float       # T-cell activation rate (vaccine potency)
+    k_kill: float     # Immune killing efficiency
+    k_off: float      # T-cell exhaustion rate
+    
+    def to_log10(self) -> np.ndarray:
+        return np.array([
+            np.log10(self.g),
+            np.log10(self.k_on),
+            np.log10(self.k_kill),
+            np.log10(self.k_off)
+        ])
+    
+    def to_array(self) -> np.ndarray:
+        return np.array([self.g, self.k_on, self.k_kill, self.k_off])
+
+
+@dataclass
+class InitialConditions:
+    """Starting state for simulation."""
+    T0: int = 100
+    I_active0: int = 0
+    I_inactive0: int = 1000
+    V: float = 1.0
+
+
+@dataclass
+class Config:
+    """Configuration for simulation."""
+    # Simulation settings
+    max_time: float = 200.0
+    max_steps: int = 1_000_000
+    tumor_cap: int = 100_000
+    tumor_extinction: int = 1
+    
+    # Observation settings
+    n_observations: int = 50
+    noise_cv: float = 0.15
+    
+    # Parameter ranges
+    g_range: Tuple[float, float] = (0.005, 0.025)
+    k_on_range: Tuple[float, float] = (1e-3, 1e-1)
+    k_kill_range: Tuple[float, float] = (1e-6, 1e-3)
+    k_off_range: Tuple[float, float] = (1e-2, 1e0)
+    T0_range: Tuple[int, int] = (50, 500)
+
+
+# =============================================================================
+# Gillespie Simulator
+# =============================================================================
+
+def gillespie_ssa(
+    params: SimulationParameters,
+    initial: InitialConditions,
+    config: Config
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    """
+    Run Gillespie stochastic simulation algorithm.
+    
+    Reaction system:
+        1. T -> 2T              (tumor growth)      propensity = g * T
+        2. I_inactive -> I_active (activation)     propensity = k_on * V * I_inactive
+        3. I_active + T -> I_active (killing)      propensity = k_kill * I_active * T
+        4. I_active -> I_inactive (exhaustion)     propensity = k_off * I_active
+    
+    Returns:
+        event_times, tumor_counts, termination_reason
+    """
+    T = float(initial.T0)
+    I_active = float(initial.I_active0)
+    I_inactive = float(initial.I_inactive0)
+    V = initial.V
+    
+    times_list = [0.0]
+    T_list = [T]
+    
+    t = 0.0
+    step = 0
+    termination_reason = "completed"
+    
+    while t < config.max_time and step < config.max_steps:
+        if T < config.tumor_extinction:
+            termination_reason = "eradicated"
+            break
+        if T > config.tumor_cap:
+            termination_reason = "escaped"
+            break
+        
+        # Calculate propensities
+        a1 = params.g * T
+        a2 = params.k_on * V * I_inactive
+        a3 = params.k_kill * I_active * T
+        a4 = params.k_off * I_active
+        a0 = a1 + a2 + a3 + a4
+        
+        if a0 <= 0:
+            termination_reason = "no_reactions"
+            break
+        
+        # Time to next reaction
+        tau = np.random.exponential(1.0 / a0)
+        
+        # Select reaction
+        r = np.random.random() * a0
+        
+        if r < a1:
+            T += 1
+        elif r < a1 + a2:
+            I_active += 1
+            I_inactive -= 1
+        elif r < a1 + a2 + a3:
+            T -= 1
+        else:
+            I_active -= 1
+            I_inactive += 1
+        
+        T = max(0, T)
+        I_active = max(0, I_active)
+        I_inactive = max(0, I_inactive)
+        
+        t += tau
+        step += 1
+        
+        times_list.append(t)
+        T_list.append(T)
+    
+    return np.array(times_list), np.array(T_list), termination_reason
+
+
+def sample_trajectory(event_times: np.ndarray, values: np.ndarray, 
+                      sample_times: np.ndarray) -> np.ndarray:
+    """Sample trajectory at specified times using step function interpolation."""
+    sampled = np.zeros(len(sample_times))
+    for i, t in enumerate(sample_times):
+        idx = np.searchsorted(event_times, t, side='right') - 1
+        idx = max(0, min(idx, len(values) - 1))
+        sampled[i] = values[idx]
+    return sampled
+
+
+def classify_response(trajectory: np.ndarray) -> ResponseCategory:
+    """Classify clinical response based on tumor trajectory."""
+    T_final = trajectory[-1]
+    T_initial = trajectory[0]
+    
+    if T_final < 10:
+        return ResponseCategory.COMPLETE_RESPONSE
+    elif T_final < 0.5 * T_initial:
+        return ResponseCategory.PARTIAL_RESPONSE
+    elif T_final < 1.2 * T_initial:
+        return ResponseCategory.STABLE_DISEASE
+    else:
+        return ResponseCategory.PROGRESSIVE_DISEASE
+
+
+# =============================================================================
+# Parameter and Schedule Sampling
+# =============================================================================
+
+def sample_parameters(config: Config) -> Tuple[SimulationParameters, InitialConditions]:
+    """Sample random parameters and initial conditions."""
+    g = np.random.uniform(*config.g_range)
+    k_on = 10 ** np.random.uniform(np.log10(config.k_on_range[0]), np.log10(config.k_on_range[1]))
+    k_kill = 10 ** np.random.uniform(np.log10(config.k_kill_range[0]), np.log10(config.k_kill_range[1]))
+    k_off = 10 ** np.random.uniform(np.log10(config.k_off_range[0]), np.log10(config.k_off_range[1]))
+    
+    params = SimulationParameters(g=g, k_on=k_on, k_kill=k_kill, k_off=k_off)
+    T0 = np.random.randint(config.T0_range[0], config.T0_range[1] + 1)
+    initial = InitialConditions(T0=T0)
+    
+    return params, initial
+
+
+def add_observation_noise(values: np.ndarray, cv: float = 0.15) -> np.ndarray:
+    """Add multiplicative lognormal noise."""
+    noise_factors = np.random.lognormal(mean=0, sigma=cv, size=len(values))
+    noisy = values * noise_factors
+    return np.maximum(noisy, 1.0)
+
+
+# =============================================================================
+# Single Sample Generation
+# =============================================================================
+
+def generate_single_sample(config: Config, seed: Optional[int] = None) -> Dict:
+    """Generate a single training sample."""
+    if seed is not None:
+        np.random.seed(seed)
+    
+    params, initial = sample_parameters(config)
+    event_times, tumor, termination = gillespie_ssa(params, initial, config)
+    
+    dense_times = np.arange(0, config.max_time + 1, 1.0)
+    dense_trajectory = sample_trajectory(event_times, tumor, dense_times)
+    
+    # Sample at fixed observation times
+    obs_indices = np.clip(OBSERVATION_TIMES.astype(int), 0, len(dense_trajectory) - 1)
+    true_values = dense_trajectory[obs_indices]
+    observed_values = add_observation_noise(true_values, config.noise_cv)
+    
+    response = classify_response(dense_trajectory)
+    
+    return {
+        'observed_values': observed_values,
+        'observation_times': OBSERVATION_TIMES.copy(),
+        'parameters_log10': params.to_log10(),
+        'parameters_raw': params.to_array(),
+        'response_category': response.value,
+        'T0': initial.T0,
+        'full_trajectory': dense_trajectory,
+        'full_times': dense_times
+    }
+
+
+# =============================================================================
+# Dataset Generation
+# =============================================================================
+
+def generate_dataset(n_samples: int, config: Optional[Config] = None,
+                     seed: int = 42, show_progress: bool = True) -> Dict[str, np.ndarray]:
+    """Generate a dataset with n_samples trajectories."""
+    if config is None:
+        config = Config()
+    
+    n_obs = len(OBSERVATION_TIMES)
+    
+    # Pre-allocate storage
+    observed_values = np.zeros((n_samples, n_obs), dtype=np.float32)
+    observation_times = np.zeros((n_samples, n_obs), dtype=np.float32)
+    parameters_log10 = np.zeros((n_samples, 4), dtype=np.float32)
+    parameters_raw = np.zeros((n_samples, 4), dtype=np.float32)
+    T0_values = np.zeros(n_samples, dtype=np.int32)
+    
+    response_map = {'complete_response': 0, 'partial_response': 1, 
+                    'stable_disease': 2, 'progressive_disease': 3}
+    responses = np.zeros(n_samples, dtype=np.int32)
+    
+    start_time = time.time()
+    
+    for i in range(n_samples):
+        sample = generate_single_sample(config, seed=seed + i)
+        
+        observed_values[i] = sample['observed_values']
+        observation_times[i] = sample['observation_times']
+        parameters_log10[i] = sample['parameters_log10']
+        parameters_raw[i] = sample['parameters_raw']
+        T0_values[i] = sample['T0']
+        responses[i] = response_map[sample['response_category']]
+        
+        if show_progress and (i + 1) % 1000 == 0:
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed
+            eta = (n_samples - i - 1) / rate
+            print(f"\rProgress: {i+1:,}/{n_samples:,} ({100*(i+1)/n_samples:.1f}%) "
+                  f"- {rate:.0f}/sec - ETA: {eta:.0f}s", end='', flush=True)
+    
+    if show_progress:
+        elapsed = time.time() - start_time
+        print(f"\nComplete: {n_samples:,} samples in {elapsed:.1f}s ({n_samples/elapsed:.0f}/sec)")
+    
+    return {
+        'observed_values': observed_values,
+        'observation_times': observation_times,
+        'parameters_log10': parameters_log10,
+        'parameters_raw': parameters_raw,
+        'T0': T0_values,
+        'response_category': responses
+    }
+
+
+def save_dataset(data: Dict[str, np.ndarray], filepath: str):
+    """Save dataset to .npz file."""
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(filepath, **data)
+    size_mb = Path(filepath).stat().st_size / (1024 * 1024)
+    print(f"Saved: {filepath} ({size_mb:.1f} MB)")
+
+
+def load_dataset(filepath: str) -> Dict[str, np.ndarray]:
+    """Load dataset from .npz file."""
+    data = np.load(filepath)
+    return {key: data[key] for key in data.files}
+
+
+def print_summary(data: Dict[str, np.ndarray]):
+    """Print dataset summary statistics."""
+    n = len(data['response_category'])
+    print(f"\nDataset Summary ({n:,} samples):")
+    print(f"  Observations per sample: {data['observed_values'].shape[1]}")
+    
+    response_names = ['CR', 'PR', 'SD', 'PD']
+    counts = np.bincount(data['response_category'], minlength=4)
+    pcts = 100 * counts / n
+    print(f"  Responses: " + ", ".join(f"{name}={c:,}({p:.0f}%)" 
+                                        for name, c, p in zip(response_names, counts, pcts)))
+    
+    param_names = ['g', 'k_on', 'k_kill', 'k_off']
+    print(f"  Parameter ranges (log10):")
+    for i, name in enumerate(param_names):
+        vals = data['parameters_log10'][:, i]
+        print(f"    {name}: [{vals.min():.2f}, {vals.max():.2f}], mean={vals.mean():.2f}")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+if __name__ == "__main__":
+    print(f"Generating {N_SAMPLES:,} trajectories...")
+    
+    config = Config()
+    data = generate_dataset(N_SAMPLES, config=config, seed=SEED)
+    save_dataset(data, OUTPUT_FILE)
+    print_summary(data)
