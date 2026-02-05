@@ -1,0 +1,664 @@
+"""
+VaxiRapTor: CNN for Vaccine Response Prediction (4-Class Classification)
+
+Predicts response category (CR, PR, SD, PD) from early tumor trajectory data.
+
+Input: First N observations (weekly measurements)
+Output: Probabilities for each response category
+
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import json
+from pathlib import Path
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+DATA_FILE = ""
+MODEL_DIR = ""
+RESULTS_DIR = ""
+
+# Early prediction: use only first N observations
+# Sampling: every 7 days for 196 days (29 observations total)
+# N_OBS = 4 = days 0, 7, 14, 21 (3 weeks)
+# N_OBS = 8 = days 0-49 (7 weeks)
+# N_OBS = 12 = days 0-77 (11 weeks)
+N_OBS = 16  # Number of early observations to use
+
+# Training settings
+EPOCHS = 100
+BATCH_SIZE = 256
+LEARNING_RATE = 1e-3
+PATIENCE = 15
+VAL_FRACTION = 0.1
+TEST_FRACTION = 0.1
+SEED = 42
+
+# Class names
+CLASS_NAMES = ['CR', 'PR', 'SD', 'PD']
+
+
+# =============================================================================
+# MODEL ARCHITECTURE
+# =============================================================================
+
+class ResidualBlock(nn.Module):
+    """Residual block with two conv layers and skip connection."""
+    
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.relu(out + residual)
+        return out
+
+
+class VaxCNN(nn.Module):
+    """
+    CNN for predicting vaccine response category from tumor trajectories.
+    
+    4-class classification: CR, PR, SD, PD
+    
+    Architecture:
+        Input: (batch, 1, n_obs)
+        → Conv blocks with residual connections
+        → Global Average Pool
+        → FC layers
+        → Softmax → class probabilities
+    """
+    
+    def __init__(self, n_timepoints, n_classes=4):
+        super().__init__()
+        
+        self.n_classes = n_classes
+        
+        # Convolutional layers
+        self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.res1 = ResidualBlock(32, kernel_size=3)
+        
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.res2 = ResidualBlock(64, kernel_size=3)
+        
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.res3 = ResidualBlock(128, kernel_size=3)
+        
+        # Global pooling
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Fully connected layers
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, n_classes)
+        )
+        
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        # Conv blocks
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.res1(x)
+        
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.res2(x)
+        
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = self.res3(x)
+        
+        # Pool and FC
+        x = self.global_pool(x)
+        logits = self.fc(x)
+        
+        return logits
+    
+    def predict_proba(self, x):
+        """Return class probabilities."""
+        logits = self.forward(x)
+        return torch.softmax(logits, dim=1)
+
+
+# =============================================================================
+# DATA LOADING
+# =============================================================================
+
+def load_data(data_path, n_obs, val_fraction=0.1, test_fraction=0.1, seed=42):
+    """Load and split data into train/val/test sets."""
+    
+    print(f"Loading data from {data_path}...")
+    data = np.load(data_path)
+    
+    X_full = data['observed_values']
+    y = data['response_category']  # 0=CR, 1=PR, 2=SD, 3=PD
+    
+    # Truncate to first n_obs observations (early prediction)
+    X = X_full[:, :n_obs]
+    
+    # Sampling every 7 days
+    last_day = (n_obs - 1) * 7
+    
+    print(f"  Total samples: {X.shape[0]:,}")
+    print(f"  Using first {n_obs} observations (days 0-{last_day}, ~{last_day//7} weeks)")
+    
+    # Class distribution
+    print(f"  Class distribution:")
+    for i, name in enumerate(CLASS_NAMES):
+        count = (y == i).sum()
+        print(f"    {name}: {count:,} ({100*count/len(y):.1f}%)")
+    
+    # Split data with stratification
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=test_fraction, random_state=seed, stratify=y
+    )
+    val_fraction_adjusted = val_fraction / (1 - test_fraction)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=val_fraction_adjusted, random_state=seed, stratify=y_temp
+    )
+    
+    print(f"  Train: {X_train.shape[0]:,}")
+    print(f"  Validation: {X_val.shape[0]:,}")
+    print(f"  Test: {X_test.shape[0]:,}")
+    
+    # Global normalization
+    X_mean = X_train.mean()
+    X_std = X_train.std()
+    
+    X_train_norm = (X_train - X_mean) / (X_std + 1e-8)
+    X_val_norm = (X_val - X_mean) / (X_std + 1e-8)
+    X_test_norm = (X_test - X_mean) / (X_std + 1e-8)
+    
+    print(f"  Normalization: mean={X_mean:.2f}, std={X_std:.2f}")
+    
+    # Add channel dimension: (N, n_obs) -> (N, 1, n_obs)
+    X_train_norm = X_train_norm[:, np.newaxis, :]
+    X_val_norm = X_val_norm[:, np.newaxis, :]
+    X_test_norm = X_test_norm[:, np.newaxis, :]
+    
+    # Class weights for imbalanced data
+    class_counts = np.bincount(y_train, minlength=4)
+    class_weights = len(y_train) / (4 * class_counts)
+    class_weights = class_weights / class_weights.sum() * 4  # Normalize
+    
+    print(f"  Class weights: {dict(zip(CLASS_NAMES, class_weights.round(2)))}")
+    
+    # Create datasets
+    train_dataset = TensorDataset(
+        torch.FloatTensor(X_train_norm),
+        torch.LongTensor(y_train)
+    )
+    val_dataset = TensorDataset(
+        torch.FloatTensor(X_val_norm),
+        torch.LongTensor(y_val)
+    )
+    test_dataset = TensorDataset(
+        torch.FloatTensor(X_test_norm),
+        torch.LongTensor(y_test)
+    )
+    
+    info = {
+        'n_train': X_train.shape[0],
+        'n_val': X_val.shape[0],
+        'n_test': X_test.shape[0],
+        'n_timepoints': n_obs,
+        'X_mean': float(X_mean),
+        'X_std': float(X_std),
+        'class_weights': class_weights,
+        'y_test': y_test,
+        'X_test_raw': X_test
+    }
+    
+    return train_dataset, val_dataset, test_dataset, info
+
+
+# =============================================================================
+# TRAINING
+# =============================================================================
+
+def train_model(model, train_loader, val_loader, device, class_weights,
+                n_epochs=100, patience=15, lr=1e-3, model_dir='models'):
+    """Train the model with early stopping."""
+    
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Weighted cross-entropy loss for class imbalance
+    weights = torch.FloatTensor(class_weights).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=8
+    )
+    
+    history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'lr': []}
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+    
+    print("\nTraining...")
+    print("-" * 60)
+    
+    for epoch in range(n_epochs):
+        # Training
+        model.train()
+        train_losses = []
+        
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            
+            optimizer.zero_grad()
+            logits = model(X_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            train_losses.append(loss.item())
+        
+        avg_train_loss = np.mean(train_losses)
+        
+        # Validation
+        model.eval()
+        val_losses = []
+        val_preds = []
+        val_labels = []
+        
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                logits = model(X_batch)
+                loss = criterion(logits, y_batch)
+                val_losses.append(loss.item())
+                
+                preds = torch.argmax(logits, dim=1).cpu().numpy()
+                val_preds.extend(preds)
+                val_labels.extend(y_batch.cpu().numpy())
+        
+        avg_val_loss = np.mean(val_losses)
+        val_acc = np.mean(np.array(val_preds) == np.array(val_labels))
+        
+        scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        history['val_acc'].append(val_acc)
+        history['lr'].append(current_lr)
+        
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), model_dir / 'best_model.pt')
+            marker = ' *'
+        else:
+            epochs_without_improvement += 1
+            marker = ''
+        
+        if (epoch + 1) % 5 == 0 or marker:
+            print(f"Epoch {epoch+1:3d}/{n_epochs} | "
+                  f"Train: {avg_train_loss:.4f} | "
+                  f"Val: {avg_val_loss:.4f} | "
+                  f"Acc: {val_acc:.3f} | "
+                  f"LR: {current_lr:.1e}{marker}")
+        
+        if epochs_without_improvement >= patience:
+            print(f"\nEarly stopping at epoch {epoch+1}")
+            break
+    
+    torch.save(model.state_dict(), model_dir / 'final_model.pt')
+    print(f"\nBest validation loss: {best_val_loss:.4f}")
+    
+    return history
+
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+
+def evaluate_model(model, test_loader, device, y_test):
+    """Evaluate model on test set."""
+    
+    model.eval()
+    all_probs = []
+    all_preds = []
+    
+    with torch.no_grad():
+        for X_batch, _ in test_loader:
+            X_batch = X_batch.to(device)
+            logits = model(X_batch)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            preds = np.argmax(probs, axis=1)
+            all_probs.append(probs)
+            all_preds.extend(preds)
+    
+    probs = np.concatenate(all_probs, axis=0)
+    preds = np.array(all_preds)
+    
+    # Metrics
+    accuracy = (preds == y_test).mean()
+    
+    # Per-class metrics
+    cm = confusion_matrix(y_test, preds)
+    
+    print("\nTest Set Evaluation:")
+    print("-" * 60)
+    print(f"  Overall Accuracy: {accuracy:.3f}")
+    print("-" * 60)
+    
+    # Per-class accuracy
+    print("  Per-class metrics:")
+    class_acc = []
+    for i, name in enumerate(CLASS_NAMES):
+        mask = y_test == i
+        if mask.sum() > 0:
+            acc = (preds[mask] == i).mean()
+            class_acc.append(acc)
+            print(f"    {name}: Accuracy={acc:.3f}, N={mask.sum()}")
+    
+    print("-" * 60)
+    print("  Confusion Matrix:")
+    print(f"              Predicted")
+    print(f"              " + "  ".join(f"{name:>5}" for name in CLASS_NAMES))
+    for i, name in enumerate(CLASS_NAMES):
+        row = "  ".join(f"{cm[i,j]:5d}" for j in range(4))
+        print(f"  Actual {name}  {row}")
+    print("-" * 60)
+    
+    # Binary metrics (responder vs non-responder)
+    y_binary = (y_test <= 1).astype(int)  # CR/PR = 1, SD/PD = 0
+    preds_binary = (preds <= 1).astype(int)
+    binary_acc = (preds_binary == y_binary).mean()
+    
+    # Responder detection
+    responders_mask = y_binary == 1
+    recall_responders = (preds_binary[responders_mask] == 1).mean() if responders_mask.sum() > 0 else 0
+    
+    print(f"  Binary (Responder vs Non-responder):")
+    print(f"    Accuracy: {binary_acc:.3f}")
+    print(f"    Responder Recall: {recall_responders:.3f}")
+    print("-" * 60)
+    
+    metrics = {
+        'accuracy': float(accuracy),
+        'per_class_accuracy': {name: float(class_acc[i]) for i, name in enumerate(CLASS_NAMES)},
+        'confusion_matrix': cm.tolist(),
+        'binary_accuracy': float(binary_acc),
+        'responder_recall': float(recall_responders)
+    }
+    
+    return metrics, probs, preds
+
+
+# =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def plot_training_curves(history, output_path):
+    """Plot training curves."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    # Loss
+    axes[0].plot(epochs, history['train_loss'], 'b-', label='Train', linewidth=2)
+    axes[0].plot(epochs, history['val_loss'], 'r-', label='Validation', linewidth=2)
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Cross-Entropy Loss')
+    axes[0].set_title('Training Curves')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Accuracy
+    axes[1].plot(epochs, history['val_acc'], 'g-', linewidth=2)
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Validation Accuracy')
+    axes[1].set_title('Validation Accuracy')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_ylim(0, 1)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_path}")
+
+
+def plot_confusion_matrix(y_true, y_pred, output_path):
+    """Plot confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred)
+    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Raw counts
+    im1 = axes[0].imshow(cm, interpolation='nearest', cmap='Blues')
+    axes[0].set_title('Confusion Matrix (Counts)')
+    axes[0].set_xticks(range(4))
+    axes[0].set_yticks(range(4))
+    axes[0].set_xticklabels(CLASS_NAMES)
+    axes[0].set_yticklabels(CLASS_NAMES)
+    axes[0].set_xlabel('Predicted')
+    axes[0].set_ylabel('Actual')
+    
+    for i in range(4):
+        for j in range(4):
+            axes[0].text(j, i, f'{cm[i, j]}', ha='center', va='center',
+                        color='white' if cm[i, j] > cm.max()/2 else 'black')
+    
+    plt.colorbar(im1, ax=axes[0])
+    
+    # Normalized
+    im2 = axes[1].imshow(cm_norm, interpolation='nearest', cmap='Blues', vmin=0, vmax=1)
+    axes[1].set_title('Confusion Matrix (Normalized)')
+    axes[1].set_xticks(range(4))
+    axes[1].set_yticks(range(4))
+    axes[1].set_xticklabels(CLASS_NAMES)
+    axes[1].set_yticklabels(CLASS_NAMES)
+    axes[1].set_xlabel('Predicted')
+    axes[1].set_ylabel('Actual')
+    
+    for i in range(4):
+        for j in range(4):
+            axes[1].text(j, i, f'{cm_norm[i, j]:.2f}', ha='center', va='center',
+                        color='white' if cm_norm[i, j] > 0.5 else 'black')
+    
+    plt.colorbar(im2, ax=axes[1])
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_path}")
+
+
+def plot_probability_distributions(y_true, probs, output_path):
+    """Plot distribution of predicted probabilities for each class."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes.flatten()
+    
+    colors = ['#2ecc71', '#f39c12', '#3498db', '#e74c3c']
+    
+    for i, (ax, name, color) in enumerate(zip(axes, CLASS_NAMES, colors)):
+        # Probability assigned to this class
+        class_probs = probs[:, i]
+        
+        # Split by actual class
+        for j, (actual_name, actual_color) in enumerate(zip(CLASS_NAMES, colors)):
+            mask = y_true == j
+            ax.hist(class_probs[mask], bins=30, alpha=0.5, 
+                   label=f'Actual {actual_name}', color=actual_color, density=True)
+        
+        ax.set_xlabel(f'P({name})')
+        ax.set_ylabel('Density')
+        ax.set_title(f'Distribution of P({name})')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_path}")
+
+
+def plot_per_class_accuracy(metrics, output_path):
+    """Plot per-class accuracy."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    colors = ['#2ecc71', '#f39c12', '#3498db', '#e74c3c']
+    accuracies = [metrics['per_class_accuracy'][name] for name in CLASS_NAMES]
+    
+    bars = ax.bar(CLASS_NAMES, accuracies, color=colors, edgecolor='black')
+    ax.axhline(y=metrics['accuracy'], color='black', linestyle='--', 
+               linewidth=2, label=f'Overall: {metrics["accuracy"]:.3f}')
+    
+    ax.set_xlabel('Response Category')
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Per-Class Accuracy')
+    ax.set_ylim(0, 1)
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for bar, acc in zip(bars, accuracies):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+               f'{acc:.2f}', ha='center', va='bottom', fontsize=11)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_path}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    # Set seeds
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    
+    # Device
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print("Using MPS (Apple Silicon)")
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+        print("Using CUDA")
+    else:
+        device = torch.device('cpu')
+        print("Using CPU")
+    
+    print("=" * 60)
+    print("VaxCNN: Response Category Prediction (4-Class)")
+    print("=" * 60)
+    print(f"\nPredicting response category from first {N_OBS} observations")
+    print(f"(Days 0-{(N_OBS-1)*7}, ~{(N_OBS-1)} weeks)")
+    
+    # Create directories
+    Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
+    Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    
+    # Load data
+    train_dataset, val_dataset, test_dataset, info = load_data(
+        DATA_FILE,
+        n_obs=N_OBS,
+        val_fraction=VAL_FRACTION,
+        test_fraction=TEST_FRACTION,
+        seed=SEED
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    
+    # Create model
+    model = VaxCNN(n_timepoints=N_OBS, n_classes=4)
+    model = model.to(device)
+    
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel parameters: {n_params:,}")
+    
+    # Train
+    history = train_model(
+        model, train_loader, val_loader, device,
+        class_weights=info['class_weights'],
+        n_epochs=EPOCHS,
+        patience=PATIENCE,
+        lr=LEARNING_RATE,
+        model_dir=MODEL_DIR
+    )
+    
+    # Load best model
+    model.load_state_dict(torch.load(Path(MODEL_DIR) / 'best_model.pt', weights_only=True))
+    
+    # Evaluate
+    metrics, probs, preds = evaluate_model(model, test_loader, device, info['y_test'])
+    
+    # Save metrics
+    metrics['config'] = {
+        'n_obs': N_OBS,
+        'days': (N_OBS - 1) * 7,
+        'epochs': EPOCHS,
+        'batch_size': BATCH_SIZE,
+        'learning_rate': LEARNING_RATE,
+        'patience': PATIENCE
+    }
+    metrics['data'] = {
+        'n_train': info['n_train'],
+        'n_val': info['n_val'],
+        'n_test': info['n_test']
+    }
+    metrics['timestamp'] = datetime.now().isoformat()
+    
+    with open(Path(RESULTS_DIR) / 'metrics.json', 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    # Save normalization params
+    norm_params = {'X_mean': info['X_mean'], 'X_std': info['X_std']}
+    with open(Path(MODEL_DIR) / 'normalization.json', 'w') as f:
+        json.dump(norm_params, f, indent=2)
+    
+    # Plots
+    print("\nGenerating plots...")
+    plot_training_curves(history, Path(RESULTS_DIR) / 'training_curves.png')
+    plot_confusion_matrix(info['y_test'], preds, Path(RESULTS_DIR) / 'confusion_matrix.png')
+    plot_probability_distributions(info['y_test'], probs, Path(RESULTS_DIR) / 'probability_distributions.png')
+    plot_per_class_accuracy(metrics, Path(RESULTS_DIR) / 'per_class_accuracy.png')
+    
+    print("\n" + "=" * 60)
+    print("Complete!")
+    print(f"  Overall Accuracy: {metrics['accuracy']:.3f}")
+    print(f"  Binary Accuracy:  {metrics['binary_accuracy']:.3f}")
+    print(f"  Per-class: " + ", ".join(f"{name}={metrics['per_class_accuracy'][name]:.2f}" 
+                                        for name in CLASS_NAMES))
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
